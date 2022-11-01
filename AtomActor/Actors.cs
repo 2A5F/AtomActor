@@ -26,9 +26,9 @@ public class Actors
     }
 
     public void AddByCores<T>(Func<T> ctor) where T : class =>
-        AddN(ctor, Environment.ProcessorCount);
+        AddN(Environment.ProcessorCount, ctor);
 
-    public void AddN<T>(Func<T> ctor, int nums) where T : class
+    public void AddN<T>(int nums, Func<T> ctor) where T : class
     {
         Debug.Assert(nums > 0);
         var bag = GetBag<T>();
@@ -49,14 +49,26 @@ internal class ActorBag
 {
     public static void Send<A, M>(ActorBag<A> self, M msg) where A : class, IPort<M>
     {
-        var type = typeof(IPort<M>);
-        var queue = Unsafe.As<ActorQueue<M>>(self.queues.GetOrAdd(type, _ => new ActorQueue<M>())).queue;
-        self.actions.GetOrAdd(type, static (_, queue) => actor => {
-            if (queue.TryDequeue(out var m)) actor.Port(m);
-            else throw new NotImplementedException("never");
-        }, queue);
-        queue.Enqueue(msg);
-        self.channel.Post(type);
+        self.Post(typeof(IPort<M>), msg, static (_, queue) => actor => {
+            var msg = queue.StrictDequeue();
+            actor.Port(msg);
+        });
+    }
+
+    public static void Send<A, M1, M2>(ActorBag<A> self, M1 m1, M2 m2) where A : class, IPort<M1, M2>
+    {
+        self.Post(typeof(IPort<M1, M2>), (m1, m2), static (_, queue) => actor => {
+            var (m1, m2) = queue.StrictDequeue();
+            actor.Port(m1, m2);
+        });
+    }
+
+    public static void Send<A, M1, M2, M3>(ActorBag<A> self, M1 m1, M2 m2, M3 m3) where A : class, IPort<M1, M2, M3>
+    {
+        self.Post(typeof(IPort<M1, M2, M3>), (m1, m2, m3), static (_, queue) => actor => {
+            var (m1, m2, m3) = queue.StrictDequeue();
+            actor.Port(m1, m2, m3);
+        });
     }
 }
 
@@ -66,6 +78,29 @@ internal class ActorBag<T> : ActorBag where T : class
     internal readonly ActorChannel channel = new();
     internal readonly ConcurrentDictionary<Type, ActorQueue> queues = new();
     internal readonly ConcurrentDictionary<Type, Action<T>> actions = new();
+
+    #region Post
+
+    internal ActorQueue<M> UnsafeGetQueue<M>(Type type) =>
+        Unsafe.As<ActorQueue<M>>(queues.GetOrAdd(type, _ => new ActorQueue<M>()));
+
+    internal void EnsureAction<M>(ActorQueue<M> queue, Type type, Func<Type, ActorQueue<M>, Action<T>> fn) =>
+        actions.GetOrAdd(type, fn, queue);
+
+    internal void Post<M>(ActorQueue<M> queue, Type type, M msg)
+    {
+        queue.Enqueue(msg);
+        channel.Post(type);
+    }
+
+    public void Post<M>(Type type, M msg, Func<Type, ActorQueue<M>, Action<T>> fn)
+    {
+        var queue = UnsafeGetQueue<M>(type);
+        EnsureAction(queue, type, fn);
+        Post(queue, type, msg);
+    }
+
+    #endregion
 
     public void Add(T actor)
     {
@@ -103,6 +138,14 @@ internal class ActorQueue { }
 internal class ActorQueue<T> : ActorQueue
 {
     public readonly ConcurrentQueue<T> queue = new();
+
+    public T StrictDequeue()
+    {
+        if (queue.TryDequeue(out var msg)) return msg;
+        throw new NotImplementedException("never");
+    }
+
+    public void Enqueue(T msg) => queue.Enqueue(msg);
 }
 
 internal class ActorChannel
