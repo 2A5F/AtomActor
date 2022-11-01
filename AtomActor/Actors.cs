@@ -1,7 +1,6 @@
 ﻿using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
-using System.Threading.Channels;
 
 namespace AtomActor;
 
@@ -11,23 +10,25 @@ public class Actors
 
     private readonly ConcurrentDictionary<Type, ActorBag> items = new();
 
-    internal ActorBag<T> GetBag<T>() => Unsafe.As<ActorBag<T>>(items.GetOrAdd(typeof(T), _ => new ActorBag<T>()));
+    internal ActorBag<T> GetBag<T>() where T : class =>
+        Unsafe.As<ActorBag<T>>(items.GetOrAdd(typeof(T), _ => new ActorBag<T>()));
 
-    internal ActorBag<T>? TryGetBag<T>()
+    internal ActorBag<T>? TryGetBag<T>() where T : class
     {
         items.TryGetValue(typeof(T), out var bag);
         return Unsafe.As<ActorBag<T>?>(bag);
     }
 
-    public void Add<T>(T inst)
+    public void Add<T>(T inst) where T : class
     {
         var bag = GetBag<T>();
         bag.Add(inst);
     }
 
-    public void AddByCores<T>(Func<T> ctor) => AddN(ctor, Environment.ProcessorCount);
+    public void AddByCores<T>(Func<T> ctor) where T : class =>
+        AddN(ctor, Environment.ProcessorCount);
 
-    public void AddN<T>(Func<T> ctor, int nums)
+    public void AddN<T>(Func<T> ctor, int nums) where T : class
     {
         Debug.Assert(nums > 0);
         var bag = GetBag<T>();
@@ -37,7 +38,7 @@ public class Actors
         }
     }
 
-    public Actor<T> Get<T>()
+    public Actor<T> Get<T>() where T : class
     {
         var bag = GetBag<T>();
         return new Actor<T>(this, bag);
@@ -46,40 +47,54 @@ public class Actors
 
 internal class ActorBag
 {
-    public static void Send<A, M>(ActorBag<A> self, M msg) where A : IPort<M>
+    public static void Send<A, M>(ActorBag<A> self, M msg) where A : class, IPort<M>
     {
-        var type = typeof(M);
+        var type = typeof(IPort<M>);
         var queue = Unsafe.As<ActorQueue<M>>(self.queues.GetOrAdd(type, _ => new ActorQueue<M>())).queue;
-        self.actions.GetOrAdd(type, static (_, queue) => async actor => {
-            if (queue.TryDequeue(out var m)) await actor.Port(m);
+        self.actions.GetOrAdd(type, static (_, queue) => actor => {
+            if (queue.TryDequeue(out var m)) actor.Port(m);
             else throw new NotImplementedException("never");
         }, queue);
         queue.Enqueue(msg);
-        self.channel.Writer.TryWrite(type);
+        self.channel.Post(type);
     }
 }
 
-internal class ActorBag<T> : ActorBag
+internal class ActorBag<T> : ActorBag where T : class
 {
-    // internal readonly ConcurrentBag<T> bag = new();
-    internal readonly Channel<Type> channel = Channel.CreateUnbounded<Type>();
+    internal readonly ConcurrentDictionary<T, ActorTask> bag = new();
+    internal readonly ActorChannel channel = new();
     internal readonly ConcurrentDictionary<Type, ActorQueue> queues = new();
-    internal readonly ConcurrentDictionary<Type, Func<T, ValueTask>> actions = new();
+    internal readonly ConcurrentDictionary<Type, Action<T>> actions = new();
 
     public void Add(T actor)
     {
-        // bag.Add(actor);
-        Task.Run(async () => {
-            for (;;)
+        var cts = new CancellationTokenSource();
+        var token = cts.Token;
+        var task = Task.Factory.StartNew(() => {
+            while (!token.IsCancellationRequested)
             {
-                var type = await channel.Reader.ReadAsync();
+                var type = channel.Take(token);
                 if (actions.TryGetValue(type, out var action))
                 {
-                    await action(actor);
+                    action(actor);
                 }
                 else throw new NotImplementedException("never");
             }
-        });
+        }, TaskCreationOptions.LongRunning);
+        bag.TryAdd(actor, new ActorTask(cts, task));
+    }
+}
+
+internal class ActorTask
+{
+    public readonly CancellationTokenSource cts;
+    public readonly Task task;
+
+    public ActorTask(CancellationTokenSource cts, Task task)
+    {
+        this.cts = cts;
+        this.task = task;
     }
 }
 
@@ -88,4 +103,26 @@ internal class ActorQueue { }
 internal class ActorQueue<T> : ActorQueue
 {
     public readonly ConcurrentQueue<T> queue = new();
+}
+
+internal class ActorChannel
+{
+    public readonly ConcurrentQueue<Type> queue = new();
+    public readonly ManualResetEventSlim signal = new();
+
+    public void Post(Type type)
+    {
+        queue.Enqueue(type);
+        signal.Set();
+    }
+
+    public Type Take(CancellationToken token)
+    {
+        for (;;)
+        {
+            if (queue.TryDequeue(out var type)) return type;
+            signal.Wait(token);
+            signal.Reset();
+        }
+    }
 }

@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using AtomActor;
 
 namespace Tests;
@@ -21,10 +22,9 @@ public class Tests
             this.box = box;
         }
 
-        public ValueTask Port(int msg)
+        public void Port(int msg)
         {
             Interlocked.Add(ref box.count, msg);
-            return ValueTask.CompletedTask;
         }
     }
 
@@ -56,10 +56,9 @@ public class Tests
             incrementer = actors.Get<Incrementer>();
         }
 
-        public ValueTask Port(int msg)
+        public void Port(int msg)
         {
             incrementer.Send(msg + msg);
-            return ValueTask.CompletedTask;
         }
     }
     

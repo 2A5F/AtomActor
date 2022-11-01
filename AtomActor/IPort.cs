@@ -2,5 +2,5 @@
 
 public interface IPort<in T>
 {
-    public ValueTask Port(T msg);
+    public void Port(T msg);
 }
