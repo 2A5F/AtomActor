@@ -98,45 +98,88 @@ internal abstract class ActorBag<A> : ActorBag where A : class
 
 internal class ActorBag<A, M> : ActorBag<A> where A : class, IActor<M>
 {
-    internal readonly ConcurrentDictionary<A, ActorTask> bag = new();
-    internal readonly Channel<M> channel = Channel.CreateUnbounded<M>();
+    private readonly ConcurrentDictionary<A, ActorTask<A, M>> map = new();
+    private readonly List<ActorTask<A, M>> list = new();
+    private readonly object list_lock = new();
 
     public override void Add(A actor)
     {
-        var cts = new CancellationTokenSource();
-        var token = cts.Token;
-        var task = Task.Run(async () => {
-            while (!token.IsCancellationRequested)
-            {
-                for (var retry = 0; retry < 100; retry++)
-                {
-                    if (channel.Reader.TryRead(out var msg))
-                    {
-                        actor.Receive(msg);
-                        retry = 0;
-                    }
-                }
+        var task = new ActorTask<A, M>(actor);
+        map.TryAdd(actor, task);
 
-                await channel.Reader.WaitToReadAsync(token);
-            }
-        }, token);
-        bag.TryAdd(actor, new ActorTask(cts, task));
+        lock (list_lock)
+        {
+            list.Add(task);
+        }
     }
 
     public void Post(M msg)
     {
-        channel.Writer.TryWrite(msg);
+        var min = int.MaxValue;
+        ActorTask<A, M>? min_task = null;
+        foreach (var task in list)
+        {
+            var c = task.Count;
+            if (c >= min) continue;
+            min = c;
+            min_task = task;
+            if (c == 0) break;
+        }
+
+        min_task!.Enqueue(msg);
     }
 }
 
-internal class ActorTask
+internal class ActorTask<A, M> where A : class, IActor<M>
 {
-    public readonly CancellationTokenSource cts;
-    public readonly Task task;
+    private readonly Task task;
+    private readonly CancellationTokenSource cts = new();
+    private readonly Channel<M> channel = Channel.CreateUnbounded<M>();
+    private int len;
 
-    public ActorTask(CancellationTokenSource cts, Task task)
+    public int Count => Volatile.Read(ref len);
+
+    public ActorTask(A actor)
     {
-        this.cts = cts;
-        this.task = task;
+        var token = cts.Token;
+        task = Task.Factory.StartNew(async () => {
+            while (!token.IsCancellationRequested)
+            {
+                var msg = await Dequeue(token);
+                actor.Receive(msg);
+            }
+        }, token, TaskCreationOptions.LongRunning, TaskScheduler.Default);
+    }
+
+    public void Enqueue(in M msg)
+    {
+        Interlocked.Increment(ref len);
+        channel.Writer.TryWrite(msg);
+    }
+
+    private async ValueTask<M> Dequeue(CancellationToken token)
+    {
+        loop:
+        for (;;)
+        {
+            int l;
+            do
+            {
+                l = Volatile.Read(ref len);
+                if (l != 0) continue;
+                await channel.Reader.WaitToReadAsync(token);
+                goto loop;
+            }
+            while (Interlocked.CompareExchange(ref len, l - 1, l) != l);
+
+            if (l < 0) throw new Exception("Fatal error, Incorrect memory data");
+
+            for (var i = 0; i < 1000; i++)
+            {
+                if (channel.Reader.TryRead(out var msg)) return msg;
+            }
+
+            return await channel.Reader.ReadAsync(token);
+        }
     }
 }
